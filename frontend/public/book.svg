@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <defs>
+    <linearGradient id="cover" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#5ee7df" />
+      <stop offset="100%" stop-color="#30cfd0" />
+    </linearGradient>
+    <linearGradient id="pages" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#f8fafc" />
+      <stop offset="100%" stop-color="#e2e8f0" />
+    </linearGradient>
+  </defs>
+  <rect x="8" y="10" width="40" height="44" rx="6" fill="url(#cover)" />
+  <path
+    d="M20 10h24a4 4 0 0 1 4 4v36l-4-2-20 2c-4 0-8-3-8-8V14a4 4 0 0 1 4-4z"
+    fill="#0f172a"
+    opacity="0.18"
+  />
+  <path
+    d="M18 14h20a4 4 0 0 1 4 4v28l-12-3-12 3V18a4 4 0 0 1 4-4z"
+    fill="url(#pages)"
+  />
+  <path d="M18 21h20" stroke="#94a3b8" stroke-linecap="round" stroke-width="2" opacity="0.65" />
+  <path d="M18 27h20" stroke="#94a3b8" stroke-linecap="round" stroke-width="2" opacity="0.45" />
+  <path d="M18 33h12" stroke="#94a3b8" stroke-linecap="round" stroke-width="2" opacity="0.4" />
+  <rect
+    x="14"
+    y="48"
+    width="22"
+    height="6"
+    rx="3"
+    fill="#0f172a"
+    opacity="0.25"
+  />
+  <path
+    d="M14 14a4 4 0 0 0-4 4v28c0 4.42 3.58 8 8 8h22"
+    stroke="#0f172a"
+    stroke-linecap="round"
+    stroke-width="2"
+    opacity="0.35"
+  />
+</svg>
+

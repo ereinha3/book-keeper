@@ -1,2 +1,6 @@
 
-openlibrary
+requests>=2.31.0
+Pillow
+fastapi
+uvicorn[standard]
+httpx>=0.27.0

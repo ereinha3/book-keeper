@@ -1,28 +1,15 @@
-import json
-import os
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlencode
 
-import pandas
 import requests
-
-try:
-    from olclient.openlibrary import OpenLibrary as _OpenLibrary  # type: ignore[import-not-found]
-except ImportError as import_error:
-    _OpenLibrary = None
-    _OPEN_LIBRARY_IMPORT_ERROR = import_error
-else:
-    _OPEN_LIBRARY_IMPORT_ERROR = None
 
 
 DEFAULT_COLUMNS = [
     "title",
     "subtitle",
     "authors",
-    "publish_year",
+    "first_publish_year",
     "edition_count",
     "openlibrary_key",
     "cover_url",
@@ -31,14 +18,12 @@ DEFAULT_COLUMNS = [
     "publisher",
     "number_of_pages_median",
 ]
-COVER_URL_TEMPLATE = "https://covers.openlibrary.org/b/id/{cover_id}-M.jpg"
-PAGE_SIZE = 5
 
 DEFAULT_API_FIELDS = [
     "title",
     "subtitle",
     "author_name",
-    "publish_year",
+    "first_publish_year",
     "edition_count",
     "cover_i",
     "isbn",
@@ -48,21 +33,8 @@ DEFAULT_API_FIELDS = [
     "key",
 ]
 
-_OPEN_LIBRARY_CLIENT: Optional[Any] = None
-
-
-def get_openlibrary_client():
-    """Return a cached Open Library client instance."""
-    if _OpenLibrary is None:
-        raise ImportError(
-            "The 'openlibrary-client' package is required. "
-            "Install it with 'pip install openlibrary-client'."
-        ) from _OPEN_LIBRARY_IMPORT_ERROR
-
-    global _OPEN_LIBRARY_CLIENT
-    if _OPEN_LIBRARY_CLIENT is None:
-        _OPEN_LIBRARY_CLIENT = _OpenLibrary()
-    return _OPEN_LIBRARY_CLIENT
+COVER_URL_TEMPLATE = "https://covers.openlibrary.org/b/id/{cover_id}-L.jpg"
+PAGE_SIZE = 10
 
 
 @dataclass
@@ -92,41 +64,26 @@ class OpenLibraryQuery:
         return params
 
 
-def fetch_records(query: OpenLibraryQuery) -> List[Dict[str, Any]]:
+def fetch_records(query: OpenLibraryQuery, offset: int = 0) -> Tuple[List[Dict[str, Any]], int]:
     """Fetch matching records from the Open Library Search API."""
     params = query.to_params()
+    if offset:
+        params["offset"] = str(offset)
     try:
-        client = get_openlibrary_client()
-    except ImportError:
-        client = None
-
-    try:
-        if client and hasattr(client, "get_ol_response"):
-            path = "/search.json"
-            if params:
-                path = f"{path}?{urlencode(params)}"
-            response = client.get_ol_response(path)  # type: ignore[operator]
-        elif client and hasattr(client, "session"):
-            response = client.session.get(  # type: ignore[attr-defined]
-                "https://openlibrary.org/search.json",
-                params=params,
-                timeout=15,
-            )
-            response.raise_for_status()
-        else:
-            response = requests.get(
-                "https://openlibrary.org/search.json",
-                params=params,
-                timeout=15,
-            )
-            response.raise_for_status()
+        response = requests.get(
+            "https://openlibrary.org/search.json",
+            params=params,
+            timeout=15,
+        )
+        response.raise_for_status()
         data = response.json()
-    except Exception as error:  # pragma: no cover - defensive guard
+    except requests.RequestException as error:  # pragma: no cover - defensive guard
         print(f"Unable to reach Open Library: {error}")
-        return []
+        return [], 0
 
     docs = data.get("docs", []) if isinstance(data, dict) else []
-    return rank_docs(query, docs or [])
+    ranked = rank_docs(query, docs or [])
+    return ranked, data.get("num_found", len(ranked))
 
 
 def rank_docs(query: OpenLibraryQuery, docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -151,7 +108,8 @@ def rank_docs(query: OpenLibraryQuery, docs: List[Dict[str, Any]]) -> List[Dict[
         if query.author:
             target_author = query.author.lower()
             author_ratios = [
-                SequenceMatcher(None, target_author, author).ratio() for author in authors
+                SequenceMatcher(None, target_author, author).ratio()
+                for author in authors
             ]
             best_author_ratio = max(author_ratios) if author_ratios else 0.0
             score += 4.0 * best_author_ratio
@@ -189,7 +147,7 @@ def rank_docs(query: OpenLibraryQuery, docs: List[Dict[str, Any]]) -> List[Dict[
     return [doc for _, _, doc in scored_docs]
 
 
-def describe_result(doc: Dict, index: int) -> str:
+def describe_result(doc: Dict[str, Any], index: int) -> str:
     """Return a printable description for an Open Library doc."""
     title = doc.get("title") or "Untitled"
     authors = ", ".join(doc.get("author_name", [])) or "Unknown author"
@@ -213,70 +171,11 @@ def describe_result(doc: Dict, index: int) -> str:
     return "\n".join(lines)
 
 
-def ensure_columns(frame: pandas.DataFrame) -> pandas.DataFrame:
-    """Ensure the DataFrame has the expected columns."""
-    for column in DEFAULT_COLUMNS:
-        if column not in frame.columns:
-            frame[column] = pandas.NA
-    return frame
-
-
-def load_or_create_spreadsheet() -> Tuple[pandas.DataFrame, Path]:
-    """Prompt the user to load an existing spreadsheet or create a new one."""
-    while True:
-        choice = input(
-            "Would you like to load an existing spreadsheet or create a new one? "
-            "(Enter 'load' or 'new'): "
-        ).strip().lower()
-
-        if choice not in {"load", "new"}:
-            print("Please answer with 'load' or 'new'.")
-            continue
-
-        if choice == "load":
-            path_input = input("Enter the absolute path to the spreadsheet file: ").strip()
-            path = Path(path_input).expanduser()
-            if not path.exists():
-                print("That file does not exist. Please try again.")
-                continue
-            frame = read_spreadsheet(path)
-            frame = ensure_columns(frame)
-            return frame, path
-
-        else:
-            path = Path(os.getcwd()) / "books.xlsx"
-            frame = pandas.DataFrame(columns=DEFAULT_COLUMNS)
-            save_spreadsheet(frame, path)
-            print(f"Created new spreadsheet at {path}")
-            return frame, path
-
-
-
-def read_spreadsheet(path: Path) -> pandas.DataFrame:
-    """Read a spreadsheet from disk based on its extension."""
-    suffix = path.suffix.lower()
-    if suffix == ".csv":
-        return pandas.read_csv(path)
-    if suffix in {".xlsx", ".xls"}:
-        return pandas.read_excel(path)
-    raise ValueError("Supported spreadsheet formats are .csv, .xls, or .xlsx")
-
-
-def save_spreadsheet(frame: pandas.DataFrame, path: Path) -> None:
-    """Persist the DataFrame to disk."""
-    suffix = path.suffix.lower()
-    if suffix == ".csv":
-        frame.to_csv(path, index=False)
-    elif suffix in {".xlsx", ".xls"}:
-        frame.to_excel(path, index=False)
-    else:
-        raise ValueError("Supported spreadsheet formats are .csv, .xls, or .xlsx")
-
-
-def build_record(doc: Dict) -> Dict:
-    """Create a spreadsheet-ready record from an Open Library doc."""
+def build_record(doc: Dict[str, Any]) -> Dict[str, Any]:
+    """Create a storage-ready record from an Open Library doc."""
     cover_id = doc.get("cover_i")
     cover_url = COVER_URL_TEMPLATE.format(cover_id=cover_id) if cover_id else ""
+
     isbns_raw = doc.get("isbn")
     if isinstance(isbns_raw, list) and isbns_raw:
         isbn_value = str(isbns_raw[0])
