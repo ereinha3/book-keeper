@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import {
   Box,
+  Button,
   CircularProgress,
   IconButton,
   Paper,
@@ -8,10 +9,11 @@ import {
   Tooltip,
   Typography,
   Snackbar,
+  TextField,
 } from "@mui/material";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, buildAssetUrl } from "../api/client";
-import type { Book, ShelfBlock, ShelfPlacement } from "../api/types";
+import type { Book, Shelf, ShelfBlock, ShelfPlacement } from "../api/types";
 import BookDetailDialog from "../components/BookDetailDialog";
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import ExpandLessIcon from "@mui/icons-material/ExpandLess";
@@ -33,6 +35,15 @@ export default function ShelfOverview() {
     },
     staleTime: 30 * 1000,
   });
+  const unplacedQuery = useQuery<Book[]>({
+    queryKey: ["unplaced-books"],
+    queryFn: async () => {
+      const response = await api.get<Book[]>("/api/unplaced-books");
+      return response.data;
+    },
+    staleTime: 30 * 1000,
+  });
+
   const [detailTarget, setDetailTarget] = useState<Book | null>(null);
   const [expandedRows, setExpandedRows] = useState<Set<number>>(new Set());
   const [rowPlacementsMap, setRowPlacementsMap] = useState<Record<number, ShelfPlacement[]>>({});
@@ -41,6 +52,9 @@ export default function ShelfOverview() {
     message: "",
   });
   const [pendingRowId, setPendingRowId] = useState<number | null>(null);
+  const [showAddShelf, setShowAddShelf] = useState(false);
+  const [newShelfName, setNewShelfName] = useState("");
+  const [newShelfDescription, setNewShelfDescription] = useState("");
 
   const sensors = useSensors(
     useSensor(PointerSensor, {
@@ -66,7 +80,7 @@ export default function ShelfOverview() {
     },
   });
 
-  if (structureQuery.isLoading) {
+  if (structureQuery.isLoading || unplacedQuery.isLoading) {
     return (
       <Stack alignItems="center" py={6}>
         <CircularProgress />
@@ -74,7 +88,7 @@ export default function ShelfOverview() {
     );
   }
 
-  if (structureQuery.isError) {
+  if (structureQuery.isError || unplacedQuery.isError) {
     return (
       <Paper variant="outlined" sx={{ p: 4, textAlign: "center" }}>
         <Typography variant="body1" color="error">
@@ -85,6 +99,38 @@ export default function ShelfOverview() {
   }
 
   const data = useMemo(() => structureQuery.data ?? [], [structureQuery.data]);
+  const unplacedBooks = useMemo(() => unplacedQuery.data ?? [], [unplacedQuery.data]);
+
+  const createShelfMutation = useMutation({
+    mutationFn: async ({ name, description }: { name: string; description: string }) => {
+      const response = await api.post("/api/shelves", { name, description });
+      return response.data as Shelf;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["shelf-structure"] });
+      setSnackbar({ open: true, message: "Shelf created." });
+      setShowAddShelf(false);
+      setNewShelfName("");
+      setNewShelfDescription("");
+    },
+    onError: () => {
+      setSnackbar({ open: true, message: "Unable to create shelf." });
+    },
+  });
+
+  const createRowMutation = useMutation({
+    mutationFn: async ({ shelfId }: { shelfId: number }) => {
+      const response = await api.post(`/api/shelves/${shelfId}/rows`, { name: "" });
+      return response.data;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["shelf-structure"] });
+      setSnackbar({ open: true, message: "Row added." });
+    },
+    onError: () => {
+      setSnackbar({ open: true, message: "Unable to add row." });
+    },
+  });
 
   useEffect(() => {
     if (!data || data.length === 0) {
@@ -108,6 +154,50 @@ export default function ShelfOverview() {
 
   return (
     <Stack spacing={3}>
+      <Paper sx={{ p: 3, borderRadius: 3 }}>
+        <Stack direction={{ xs: "column", md: "row" }} spacing={2} alignItems={{ xs: "flex-start", md: "center" }}>
+          <Typography variant="h6" sx={{ flexGrow: 1 }}>
+            Shelf Layout
+          </Typography>
+          <Button variant="contained" size="small" onClick={() => setShowAddShelf((prev) => !prev)}>
+            {showAddShelf ? "Cancel" : "Add shelf"}
+          </Button>
+        </Stack>
+        {showAddShelf && (
+          <Stack spacing={2} sx={{ mt: 2 }}>
+            <TextField
+              label="Shelf name"
+              value={newShelfName}
+              onChange={(event) => setNewShelfName(event.target.value)}
+              fullWidth
+              size="small"
+            />
+            <TextField
+              label="Description (optional)"
+              value={newShelfDescription}
+              onChange={(event) => setNewShelfDescription(event.target.value)}
+              fullWidth
+              size="small"
+              multiline
+              minRows={2}
+            />
+            <Button
+              variant="contained"
+              onClick={() =>
+                createShelfMutation.mutate({
+                  name: newShelfName.trim() || "New shelf",
+                  description: newShelfDescription.trim(),
+                })
+              }
+              disabled={createShelfMutation.isPending}
+            >
+              Save shelf
+            </Button>
+          </Stack>
+        )}
+      </Paper>
+
+      <UnplacedCarousel books={unplacedBooks} />
       {data.map((block) => (
         <Paper key={block.shelf.id} sx={{ p: 3, borderRadius: 3 }}>
           <Typography variant="h6" gutterBottom>
@@ -283,6 +373,14 @@ export default function ShelfOverview() {
                 );
               })
             )}
+            <Button
+              variant="outlined"
+              size="small"
+              onClick={() => createRowMutation.mutate({ shelfId: block.shelf.id })}
+              disabled={createRowMutation.isPending}
+            >
+              Add row
+            </Button>
           </Stack>
         </Paper>
       ))}
@@ -398,6 +496,75 @@ function SortablePlacementCard({
             {placement.authors ?? "Unknown author"}
           </Typography>
         </Box>
+      </Box>
+    </Box>
+  );
+}
+
+function UnplacedCarousel({ books }: { books: Book[] }) {
+  if (books.length === 0) {
+    return (
+      <Paper sx={{ p: 3, borderRadius: 3 }}>
+        <Typography variant="subtitle2" color="text.secondary">
+          All books are currently placed on shelves.
+        </Typography>
+      </Paper>
+    );
+  }
+
+  return (
+    <Paper sx={{ p: 3, borderRadius: 3 }}>
+      <Typography variant="h6" gutterBottom>
+        Unplaced Books
+      </Typography>
+      <Stack direction="row" spacing={2} sx={{ overflowX: "auto", pb: 1 }}>
+        {books.map((book) => (
+          <UnplacedCard key={book.id} book={book} />
+        ))}
+      </Stack>
+    </Paper>
+  );
+}
+
+function UnplacedCard({ book }: { book: Book }) {
+  const coverSrc = buildAssetUrl(book.cover_asset ?? book.cover_path ?? book.cover_url ?? undefined);
+  return (
+    <Box
+      sx={{
+        width: 180,
+        borderRadius: 3,
+        border: "1px solid rgba(148,163,184,0.2)",
+        backgroundColor: "rgba(15, 23, 42, 0.55)",
+        overflow: "hidden",
+        display: "flex",
+        flexDirection: "column",
+        flexShrink: 0,
+      }}
+    >
+      <Box
+        sx={{
+          height: 220,
+          backgroundColor: "rgba(148,163,184,0.1)",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+        }}
+      >
+        {coverSrc ? (
+          <Box component="img" src={coverSrc} alt={book.title ?? "Book cover"} sx={{ maxHeight: "100%", objectFit: "contain" }} />
+        ) : (
+          <Typography variant="caption" color="text.secondary">
+            No cover
+          </Typography>
+        )}
+      </Box>
+      <Box sx={{ p: 1 }}>
+        <Typography variant="subtitle2" noWrap>
+          {book.title ?? "Untitled"}
+        </Typography>
+        <Typography variant="caption" color="text.secondary" noWrap>
+          {book.authors ?? "Unknown author"}
+        </Typography>
       </Box>
     </Box>
   );
