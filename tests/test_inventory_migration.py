@@ -118,3 +118,5 @@ def test_migration_allows_multiple_copies_and_placements(legacy_store: Inventory
     placements = legacy_store.get_shelf_structure()[0]["rows"][0]["placements"]
     assert len(placements) == 2
 
+
+

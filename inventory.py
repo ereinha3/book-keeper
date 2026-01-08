@@ -535,7 +535,7 @@ class InventoryStore:
         if slot_index < 1:
             raise ValueError("slot_index must be 1 or greater.")
 
-        with self._lock:
+        with self._lock, self._conn:
             row = self._conn.execute(
                 "SELECT id FROM shelf_rows WHERE id = ?;",
                 (shelf_row_id,),
@@ -543,27 +543,27 @@ class InventoryStore:
             if row is None:
                 raise ValueError("Row not found.")
 
-            slot_taken = self._conn.execute(
-                """
-                SELECT 1 FROM placements
-                WHERE shelf_row_id = ? AND slot_index = ? AND book_id != ?;
-                """,
-                (shelf_row_id, slot_index, book_id),
+            current = self._conn.execute(
+                "SELECT shelf_row_id, slot_index FROM placements WHERE book_id = ?;",
+                (book_id,),
             ).fetchone()
-            if slot_taken:
-                raise ValueError("Another book already occupies this slot.")
+            current_row_id = current["shelf_row_id"] if current else None
+            current_slot = current["slot_index"] if current else None
 
-            with self._conn:
-                self._conn.execute(
-                    """
-                    INSERT INTO placements (book_id, shelf_row_id, slot_index)
-                    VALUES (?, ?, ?)
-                    ON CONFLICT(book_id) DO UPDATE SET
-                        shelf_row_id = excluded.shelf_row_id,
-                        slot_index = excluded.slot_index;
-                    """,
-                    (book_id, shelf_row_id, slot_index),
-                )
+            # Determine the allowable bounds for the requested slot.
+            target_count = self._conn.execute(
+                "SELECT COUNT(*) FROM placements WHERE shelf_row_id = ?;",
+                (shelf_row_id,),
+            ).fetchone()[0]
+            if current_row_id == shelf_row_id and current_slot is not None:
+                max_slot = target_count if target_count > 0 else 1
+            else:
+                max_slot = target_count + 1
+            if slot_index > max_slot:
+                slot_index = max_slot
+
+            if current_row_id == shelf_row_id and current_slot == slot_index:
+                # No-op: book already in desired slot.
                 self._conn.execute(
                     """
                     UPDATE shelf_rows
@@ -571,6 +571,128 @@ class InventoryStore:
                     WHERE id = ?;
                     """,
                     (slot_index, shelf_row_id),
+                )
+                return
+
+            shifted_target = False
+
+            if current_row_id == shelf_row_id and current_slot is not None:
+                if slot_index < current_slot:
+                    # Moving earlier in the same row; shift affected slots up.
+                    self._conn.execute(
+                        """
+                        UPDATE placements
+                        SET slot_index = slot_index + 1000
+                        WHERE shelf_row_id = ?
+                          AND slot_index >= ?
+                          AND slot_index < ?;
+                        """,
+                        (shelf_row_id, slot_index, current_slot),
+                    )
+                    self._conn.execute(
+                        """
+                        UPDATE placements
+                        SET slot_index = slot_index - 999
+                        WHERE shelf_row_id = ?
+                          AND slot_index >= 1000;
+                        """,
+                        (shelf_row_id,),
+                    )
+                else:
+                    # Moving later in the same row; shift affected slots down.
+                    self._conn.execute(
+                        """
+                        UPDATE placements
+                        SET slot_index = slot_index + 1000
+                        WHERE shelf_row_id = ?
+                          AND slot_index > ?
+                          AND slot_index <= ?;
+                        """,
+                        (shelf_row_id, current_slot, slot_index),
+                    )
+                    self._conn.execute(
+                        """
+                        UPDATE placements
+                        SET slot_index = slot_index - 1001
+                        WHERE shelf_row_id = ?
+                          AND slot_index >= 1000;
+                        """,
+                        (shelf_row_id,),
+                    )
+            else:
+                if current_row_id is not None and current_slot is not None:
+                    # Remove the book from its existing row to avoid constraint conflicts, then close the gap.
+                    self._conn.execute("DELETE FROM placements WHERE book_id = ?;", (book_id,))
+                    self._conn.execute(
+                        """
+                        UPDATE placements
+                        SET slot_index = slot_index - 1
+                        WHERE shelf_row_id = ?
+                          AND slot_index > ?;
+                        """,
+                        (current_row_id, current_slot),
+                    )
+                # Make space in the target row for the incoming book.
+                if slot_index <= target_count:
+                    shifted_target = True
+                    self._conn.execute(
+                        """
+                        UPDATE placements
+                        SET slot_index = slot_index + 1000
+                        WHERE shelf_row_id = ?
+                          AND slot_index >= ?;
+                        """,
+                        (shelf_row_id, slot_index),
+                    )
+
+            # Upsert the book into the target row.
+            self._conn.execute(
+                """
+                INSERT INTO placements (book_id, shelf_row_id, slot_index)
+                VALUES (?, ?, ?)
+                ON CONFLICT(book_id) DO UPDATE SET
+                    shelf_row_id = excluded.shelf_row_id,
+                    slot_index = excluded.slot_index;
+                """,
+                (book_id, shelf_row_id, slot_index),
+            )
+
+            if shifted_target:
+                self._conn.execute(
+                    """
+                    UPDATE placements
+                    SET slot_index = slot_index - 999
+                    WHERE shelf_row_id = ?
+                      AND slot_index >= 1000;
+                    """,
+                    (shelf_row_id,),
+                )
+
+            # Ensure capacities remain at least as large as the furthest slot in use.
+            self._conn.execute(
+                """
+                UPDATE shelf_rows
+                SET capacity = MAX(capacity, ?)
+                WHERE id = ?;
+                """,
+                (slot_index, shelf_row_id),
+            )
+            if current_row_id is not None and current_row_id != shelf_row_id:
+                max_slot_source = self._conn.execute(
+                    """
+                    SELECT COALESCE(MAX(slot_index), 0)
+                    FROM placements
+                    WHERE shelf_row_id = ?;
+                    """,
+                    (current_row_id,),
+                ).fetchone()[0]
+                self._conn.execute(
+                    """
+                    UPDATE shelf_rows
+                    SET capacity = MAX(capacity, ?)
+                    WHERE id = ?;
+                    """,
+                    (max_slot_source, current_row_id),
                 )
 
     def remove_placement(self, book_id: int) -> None:
@@ -670,13 +792,23 @@ class InventoryStore:
 
     def reorder_row(self, row_id: int, book_ids: List[int]) -> None:
         with self._lock, self._conn:
-            placeholders = ",".join("?" for _ in book_ids)
+            # Shift current slot indices out of the way to avoid transient UNIQUE conflicts
+            self._conn.execute(
+                """
+                UPDATE placements
+                SET slot_index = slot_index + 1000
+                WHERE shelf_row_id = ?;
+                """,
+                (row_id,),
+            )
+
             if book_ids:
+                placeholders = ",".join("?" for _ in book_ids)
                 self._conn.execute(
                     f"""
                     DELETE FROM placements
                     WHERE shelf_row_id = ?
-                      AND book_id NOT IN ({placeholders})
+                      AND book_id NOT IN ({placeholders});
                     """,
                     (row_id, *book_ids),
                 )
@@ -697,6 +829,16 @@ class InventoryStore:
                     """,
                     (book_id, row_id, index),
                 )
+
+            # Reset any remaining temp slot indices (> 1000) that may linger if the list was shortened
+            self._conn.execute(
+                """
+                DELETE FROM placements
+                WHERE shelf_row_id = ?
+                  AND slot_index > 1000;
+                """,
+                (row_id,),
+            )
 
             self._conn.execute(
                 "UPDATE shelf_rows SET capacity = ? WHERE id = ?;",
